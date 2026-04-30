@@ -1,0 +1,353 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+多Agent协同运营自动化系统
+使用基于消息总线的Actor模型，实现数据收集、分析、决策、执行与监控的完整自动化闭环。
+
+运行方式：
+    python multi_agent_operating_system.py
+
+系统将自动模拟产品销售数据，当检测到产品销量下滑时，Agent协同完成折扣策略制定与执行。
+按Enter键可随时优雅退出。
+"""
+
+import threading
+import queue
+import time
+import random
+import logging
+from typing import Dict, List, Any, Optional
+from dataclasses import dataclass, field
+from datetime import datetime
+
+# ---------- 日志配置 ----------
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s [%(levelname)s] %(message)s',
+    datefmt='%H:%M:%S'
+)
+logger = logging.getLogger("OpsSystem")
+
+# ---------- 消息定义 ----------
+@dataclass
+class Message:
+    """Agent间通信的消息体"""
+    type: str          # 消息类型，如 "data_event", "alert", "action", "execution_result"
+    payload: Dict      # 携带的数据
+    sender: str        # 发送者Agent名称
+    timestamp: float = field(default_factory=time.time)
+
+# 消息类型常量
+MSG_DATA_EVENT = "data_event"
+MSG_ALERT = "alert"
+MSG_ACTION = "action"
+MSG_EXEC_RESULT = "execution_result"
+
+# ---------- 消息总线 ----------
+class MessageBroker:
+    """负责消息订阅与分发（单例模式）"""
+    _instance = None
+    _lock = threading.Lock()
+
+    def __new__(cls):
+        if cls._instance is None:
+            with cls._lock:
+                if cls._instance is None:
+                    cls._instance = super().__new__(cls)
+                    cls._instance._init()
+        return cls._instance
+
+    def _init(self):
+        self.subscribers: Dict[str, List['Agent']] = {}
+        self._sub_lock = threading.Lock()
+
+    def subscribe(self, agent: 'Agent', msg_type: str):
+        """Agent订阅某种消息类型"""
+        with self._sub_lock:
+            if msg_type not in self.subscribers:
+                self.subscribers[msg_type] = []
+            if agent not in self.subscribers[msg_type]:
+                self.subscribers[msg_type].append(agent)
+
+    def unsubscribe(self, agent: 'Agent', msg_type: str):
+        """取消订阅"""
+        with self._sub_lock:
+            if msg_type in self.subscribers and agent in self.subscribers[msg_type]:
+                self.subscribers[msg_type].remove(agent)
+
+    def publish(self, message: Message):
+        """发布消息给所有订阅者"""
+        msg_type = message.type
+        with self._sub_lock:
+            subscribers = self.subscribers.get(msg_type, []).copy()
+        for agent in subscribers:
+            # 将消息放入Agent自己的队列，实现异步分发
+            agent.put_message(message)
+
+# ---------- Agent 基类 ----------
+class Agent(threading.Thread):
+    """所有智能体共同基类，拥有独立消息队列，支持周期性任务"""
+
+    def __init__(self, name: str, broker: MessageBroker):
+        super().__init__(name=name, daemon=True)
+        self.name = name
+        self.broker = broker
+        self.message_queue = queue.Queue()
+        self.running = True
+        self._last_tick = time.time()
+
+    def put_message(self, message: Message):
+        """向该Agent的消息队列投递消息"""
+        self.message_queue.put(message)
+
+    def run(self):
+        """主循环：处理消息 + 周期性回调"""
+        logger.info(f"Agent [{self.name}] 启动")
+        while self.running:
+            try:
+                # 非阻塞获取消息，等待1秒以便检查running标志及执行周期性任务
+                msg = self.message_queue.get(timeout=1.0)
+                self.handle_message(msg)
+            except queue.Empty:
+                pass
+            self._on_tick()
+        logger.info(f"Agent [{self.name}] 已停止")
+
+    def handle_message(self, message: Message):
+        """子类必须实现具体消息处理逻辑"""
+        raise NotImplementedError
+
+    def _on_tick(self):
+        """周期性回调（约1秒调用一次），子类可重写来实现定时任务"""
+        pass
+
+    def send_message(self, msg_type: str, payload: Dict, target_agent: Optional[str] = None):
+        """发送消息至总线（若指定target_agent，则只有该Agent会收到，系统暂不实现定向，使用全局订阅）"""
+        message = Message(type=msg_type, payload=payload, sender=self.name)
+        self.broker.publish(message)
+
+    def stop(self):
+        """停止Agent线程"""
+        self.running = False
+
+# ---------- 具体业务Agent实现 ----------
+
+class DataCollectorAgent(Agent):
+    """数据收集Agent：模拟外部数据源（产品销售数据），定期发布 data_event"""
+    def __init__(self, name: str, broker: MessageBroker, collect_interval: float = 3.0):
+        super().__init__(name, broker)
+        self.collect_interval = collect_interval      # 数据采集周期（秒）
+        self.last_collect_time = time.time()
+        # 初始化模拟产品销量趋势（基准值 + 随机因子）
+        self.products = {
+            "Product_A": {"base": 180, "trend": -1.5, "noise": 5},   # 持续缓慢下降
+            "Product_B": {"base": 220, "trend": +0.8, "noise": 6},    # 缓慢上升
+            "Product_C": {"base": 95,  "trend": -0.2, "noise": 4},     # 轻微波动
+        }
+
+    def _on_tick(self):
+        """周期性检查是否需要收集并发布新数据"""
+        now = time.time()
+        if now - self.last_collect_time >= self.collect_interval:
+            self.collect_and_publish()
+            self.last_collect_time = now
+
+    def collect_and_publish(self):
+        """模拟采集数据：根据趋势生成当前销量"""
+        sales_data = {}
+        for pid, params in self.products.items():
+            # 趋势 + 随机扰动，确保为正整数
+            trend_val = params["trend"] * self.collect_interval
+            noise = random.uniform(-params["noise"], params["noise"])
+            current = params["base"] + trend_val + noise
+            # 动态更新base以便趋势持续（模拟连续过程）
+            params["base"] = max(20, current)
+            sales_data[pid] = int(max(0, current))
+
+        payload = {
+            "timestamp": time.time(),
+            "sales": sales_data,
+            "source": "simulated_retail"
+        }
+        self.send_message(MSG_DATA_EVENT, payload)
+        logger.info(f"[{self.name}] 发布数据事件: {sales_data}")
+
+class AnalystAgent(Agent):
+    """分析Agent：订阅数据事件，检测销量下滑趋势，必要时发出 alert"""
+    def __init__(self, name: str, broker: MessageBroker):
+        super().__init__(name, broker)
+        self.history: Dict[str, List[int]] = {}      # 记录每个产品的销量历史
+        self.alert_cooldown: Dict[str, float] = {}   # 防止重复告警
+
+    def handle_message(self, message: Message):
+        if message.type == MSG_DATA_EVENT:
+            sales = message.payload.get("sales", {})
+            for product, qty in sales.items():
+                self.history.setdefault(product, []).append(qty)
+                # 只保留最近5个数据点
+                if len(self.history[product]) > 5:
+                    self.history[product].pop(0)
+                # 分析下滑（至少需要3个点）
+                if len(self.history[product]) >= 3:
+                    recent = self.history[product][-3:]
+                    # 连续两次下降且累计跌幅超过15%
+                    if recent[0] > recent[1] > recent[2]:
+                        decline_rate = (recent[0] - recent[2]) / recent[0]
+                        if decline_rate > 0.15:
+                            self.trigger_alert(product, recent[2], decline_rate)
+
+    def trigger_alert(self, product: str, current_qty: int, decline_rate: float):
+        """发送告警，带冷却时间（10秒内不重复告警同一产品）"""
+        now = time.time()
+        last = self.alert_cooldown.get(product, 0)
+        if now - last < 10:
+            return
+        self.alert_cooldown[product] = now
+        payload = {
+            "product": product,
+            "current_sales": current_qty,
+            "decline_rate": round(decline_rate * 100, 1),
+            "severity": "medium" if decline_rate > 0.25 else "low",
+            "suggestion": f"建议对{product}进行限时折扣，以刺激销量"
+        }
+        self.send_message(MSG_ALERT, payload)
+        logger.warning(f"[{self.name}] 发出告警: {product} 销量下滑 {decline_rate*100:.1f}%")
+
+class DecisionAgent(Agent):
+    """决策Agent：订阅告警，制定具体营销动作（生成折扣策略等）"""
+    def __init__(self, name: str, broker: MessageBroker):
+        super().__init__(name, broker)
+        self.action_cooldown: Dict[str, float] = {}
+
+    def handle_message(self, message: Message):
+        if message.type == MSG_ALERT:
+            product = message.payload["product"]
+            decline = message.payload["decline_rate"]
+            now = time.time()
+            if product in self.action_cooldown and now - self.action_cooldown[product] < 15:
+                logger.debug(f"[{self.name}] 产品{product}策略冷却中，跳过")
+                return
+            # 根据下滑幅度决定折扣力度
+            if decline > 25:
+                discount = 20
+            elif decline > 15:
+                discount = 12
+            else:
+                discount = 8
+            action_payload = {
+                "action_type": "apply_discount",
+                "product": product,
+                "discount_percent": discount,
+                "duration_hours": 48,
+                "reason": f"应对销量下滑{decline}%"
+            }
+            self.send_message(MSG_ACTION, action_payload)
+            self.action_cooldown[product] = now
+            logger.info(f"[{self.name}] 决策: 对 {product} 实施 {discount}% 折扣促销")
+
+class ExecutorAgent(Agent):
+    """执行Agent：订阅动作消息，模拟执行运营操作（更新折扣、发券等），并反馈结果"""
+    def __init__(self, name: str, broker: MessageBroker):
+        super().__init__(name, broker)
+        self.executed_actions: List[Dict] = []
+
+    def handle_message(self, message: Message):
+        if message.type == MSG_ACTION:
+            action = message.payload
+            action_type = action.get("action_type")
+            product = action.get("product")
+            discount = action.get("discount_percent")
+            logger.info(f"[{self.name}] 执行操作: 对【{product}】设置 {discount}% 折扣 (有效期 {action.get('duration_hours')}h)")
+
+            # 模拟执行（实际可调用外部API）
+            result_payload = {
+                "success": True,
+                "action_id": f"act_{int(time.time())}",
+                "product": product,
+                "applied_discount": discount,
+                "timestamp": time.time()
+            }
+            self.send_message(MSG_EXEC_RESULT, result_payload)
+            self.executed_actions.append(result_payload)
+
+class MonitorAgent(Agent):
+    """监控Agent：订阅所有关键消息，记录并展示运营全链路状态"""
+    def __init__(self, name: str, broker: MessageBroker):
+        super().__init__(name, broker)
+        self.event_log: List[Message] = []
+        self.stats = {"alerts": 0, "actions": 0, "executions": 0}
+
+    def handle_message(self, message: Message):
+        # 记录所有收到的消息用于监控展示
+        self.event_log.append(message)
+        if message.type == MSG_ALERT:
+            self.stats["alerts"] += 1
+            logger.info(f"📊 [监控] 告警统计: 累计 {self.stats['alerts']} 次")
+        elif message.type == MSG_ACTION:
+            self.stats["actions"] += 1
+            logger.info(f"⚙️ [监控] 决策统计: 累计 {self.stats['actions']} 个动作")
+        elif message.type == MSG_EXEC_RESULT:
+            self.stats["executions"] += 1
+            logger.info(f"✅ [监控] 执行结果: {message.payload.get('product')} 折扣应用成功")
+        elif message.type == MSG_DATA_EVENT:
+            # 可选: 简略展示数据流入
+            sales = message.payload.get("sales", {})
+            logger.debug(f"[监控] 数据流入: {sales}")
+
+    def _on_tick(self):
+        """每10秒打印一次总结报告"""
+        now = time.time()
+        if not hasattr(self, "_last_report"):
+            self._last_report = now
+        if now - self._last_report >= 10.0:
+            self._last_report = now
+            logger.info("===== 运营监控报告 =====")
+            logger.info(f"告警次数: {self.stats['alerts']}  决策次数: {self.stats['actions']}  执行成功: {self.stats['executions']}")
+            logger.info(f"系统运行中，Agent数={threading.active_count()-1} (含主线程)")
+            logger.info("=======================")
+
+# ---------- 系统启动与调度 ----------
+def main():
+    print("\n========== 多Agent协同运营自动化系统启动 ==========")
+    print("系统将自动采集模拟销售数据 → 分析趋势 → 告警 → 制定折扣 → 执行")
+    print("按 Enter 键优雅退出系统\n")
+
+    broker = MessageBroker()
+
+    # 创建所有Agent
+    data_agent = DataCollectorAgent("DataCollector", broker, collect_interval=3.0)
+    analyst_agent = AnalystAgent("Analyst", broker)
+    decision_agent = DecisionAgent("DecisionMaker", broker)
+    executor_agent = ExecutorAgent("Executor", broker)
+    monitor_agent = MonitorAgent("Monitor", broker)
+
+    # 订阅关系 (每个Agent订阅自己关心的消息类型)
+    analyst_agent.broker.subscribe(analyst_agent, MSG_DATA_EVENT)
+    decision_agent.broker.subscribe(decision_agent, MSG_ALERT)
+    executor_agent.broker.subscribe(executor_agent, MSG_ACTION)
+    monitor_agent.broker.subscribe(monitor_agent, MSG_DATA_EVENT)
+    monitor_agent.broker.subscribe(monitor_agent, MSG_ALERT)
+    monitor_agent.broker.subscribe(monitor_agent, MSG_ACTION)
+    monitor_agent.broker.subscribe(monitor_agent, MSG_EXEC_RESULT)
+
+    # 启动所有Agent线程
+    agents = [data_agent, analyst_agent, decision_agent, executor_agent, monitor_agent]
+    for ag in agents:
+        ag.start()
+
+    # 主线程等待外部退出指令
+    try:
+        input("系统运行中... 按 Enter 键停止系统\n")
+    except KeyboardInterrupt:
+        pass
+    finally:
+        logger.info("主线程收到退出信号，正在停止所有Agent...")
+        for ag in agents:
+            ag.stop()
+        # 等待线程结束
+        for ag in agents:
+            ag.join(timeout=2.0)
+        logger.info("所有Agent已停止，系统退出。")
+
+if __name__ == "__main__":
+    main()
